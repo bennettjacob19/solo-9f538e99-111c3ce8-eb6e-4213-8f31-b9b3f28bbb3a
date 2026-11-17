@@ -174,12 +174,74 @@
       <thead>
         <tr>
           <th>制品</th><th>状态</th><th class="num">连续失败</th><th class="num">冷却剩余</th>
-          <th class="num">探测代次</th><th class="num">纪元</th><th>最近错误</th>
+          <th class="num">故障代次</th><th class="num">探测代次</th><th class="num">纪元</th><th>最近错误</th>
         </tr>
       </thead>
       <tbody id="breakerBody"></tbody>
     </table>
     <div class="empty" id="breakerEmpty" style="display:none">还没有查询记录。</div>
+  </section>
+
+  <section>
+    <h2>告警接收器 <small>本地接收器 · 事件按 ID 幂等去重 · 网关出盒持久重试</small></h2>
+    <div class="switch" id="receiverSwitch">
+      <button data-rmode="accept">接收告警</button>
+      <button data-rmode="reject">拒收告警（演练）</button>
+    </div>
+    <div class="hint" id="receiverHint">接收器状态：读取中…</div>
+    <div class="statgrid" style="margin-top:12px">
+      <div class="stat"><div class="v" id="alertPending">–</div><div class="k">待发事件</div></div>
+      <div class="stat"><div class="v" id="alertDelivered">–</div><div class="k">网关已送达</div></div>
+      <div class="stat"><div class="v" id="alertReceived">–</div><div class="k">接收器已收</div></div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button id="refreshAlertsBtn">刷新告警</button>
+      <button class="danger" id="clearReceivedBtn">清空已收记录</button>
+    </div>
+    <div class="hint">首次熔断 / 探测恢复 / 人工重置会生成带制品名、故障代次与原因的状态事件；接收器拒收或网关重启后事件继续投递，重试只更新同一条记录。</div>
+  </section>
+
+  <div class="grid2">
+    <section>
+      <h2>待发告警 <small>网关出盒；同一制品按发生顺序送达，恢复不越过待发的熔断</small></h2>
+      <table>
+        <thead>
+          <tr>
+            <th>制品</th><th>事件</th><th class="num">代次</th><th>原因</th>
+            <th class="num">已尝试</th><th class="num">下次重试</th><th>最近错误</th>
+          </tr>
+        </thead>
+        <tbody id="outboxBody"></tbody>
+      </table>
+      <div class="empty" id="outboxEmpty" style="display:none">没有待发事件。</div>
+    </section>
+
+    <section>
+      <h2>接收器已收记录 <small>同一事件重试只增加 deliveries，不新增记录</small></h2>
+      <table>
+        <thead>
+          <tr>
+            <th class="num">#</th><th>时间</th><th>制品</th><th>事件</th>
+            <th class="num">代次</th><th>原因</th><th class="num">投递次数</th>
+          </tr>
+        </thead>
+        <tbody id="receivedBody"></tbody>
+      </table>
+      <div class="empty" id="receivedEmpty" style="display:none">接收器还没有收到告警。</div>
+    </section>
+  </div>
+
+  <section>
+    <h2>最近已送达 <small>网关已收到接收器确认的事件</small></h2>
+    <table>
+      <thead>
+        <tr>
+          <th>送达时间</th><th>制品</th><th>事件</th><th class="num">代次</th><th class="num">投递次数</th>
+        </tr>
+      </thead>
+      <tbody id="deliveredBody"></tbody>
+    </table>
+    <div class="empty" id="deliveredEmpty" style="display:none">还没有已送达的事件。</div>
   </section>
 
   <section>
@@ -316,6 +378,7 @@ async function refresh() {
         <td>${pill(b.state, cls)}</td>
         <td class="num">${b.failures} / ${data.threshold}</td>
         <td class="num">${b.state === "open" ? b.cooldown_remaining.toFixed(2) + "s" : "–"}</td>
+        <td class="num">${b.fault_gen}</td>
         <td class="num">${b.probe_gen}</td>
         <td class="num">${b.epoch}</td>
         <td title="${esc(b.last_error || "")}">${esc((b.last_error || "").slice(0, 48))}</td>
@@ -333,9 +396,91 @@ async function refresh() {
       const t = new Date(e.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false });
       return `<div class="line"><b>${t}</b> ${pill(esc(e.kind), "gray")} ${esc(e.artifact)} ${esc(e.detail || "")}</div>`;
     }).join("") || `<div class="empty">暂无事件</div>`;
+
+    await refreshAlerts();
   } finally {
     state.inflight--;
   }
+}
+
+// ---------------------------------------------------------------- alerts
+const KIND_LABEL = {
+  opened: ["熔断", "open"],
+  recovered: ["恢复", "closed"],
+  reset: ["人工重置", "half_open"],
+};
+function kindPill(kind) {
+  const [label, cls] = KIND_LABEL[kind] || [kind, "gray"];
+  return pill(label, cls);
+}
+function fmtTime(ts) {
+  return ts ? new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }) : "–";
+}
+
+async function refreshAlerts() {
+  const r = await jget("/api/alerts");
+  if (!r.ok) return;
+  const data = r.body;
+  const outbox = data.outbox || {};
+  const receiver = data.receiver || {};
+  $("#alertPending").textContent = fmt(outbox.pending_count ?? 0);
+  $("#alertDelivered").textContent = fmt(outbox.delivered_count ?? 0);
+
+  const mode = receiver.mode;
+  document.querySelectorAll("#receiverSwitch button").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.rmode === mode);
+  });
+  if (receiver.error) {
+    $("#receiverHint").textContent = `接收器不可达：${receiver.error}（事件保留在出盒中继续重试）`;
+    $("#alertReceived").textContent = "–";
+  } else {
+    $("#receiverHint").textContent =
+      `接收器状态：${mode === "reject" ? "拒收中（演练）" : "接收中"} · ${data.receiver_url || ""}`;
+    $("#alertReceived").textContent = fmt(receiver.count ?? 0);
+  }
+
+  const pending = outbox.pending || [];
+  $("#outboxEmpty").style.display = pending.length ? "none" : "block";
+  $("#outboxBody").innerHTML = pending.map(e => `<tr>
+    <td>${esc(e.artifact)}</td>
+    <td>${kindPill(e.kind)}</td>
+    <td class="num">${e.fault_gen}</td>
+    <td title="${esc(e.reason || "")}">${esc((e.reason || "").slice(0, 36))}</td>
+    <td class="num">${e.attempts}</td>
+    <td class="num">${(e.retry_in ?? 0).toFixed(1)}s</td>
+    <td title="${esc(e.last_error || "")}">${esc((e.last_error || "").slice(0, 36))}</td>
+  </tr>`).join("");
+
+  const received = receiver.received || [];
+  $("#receivedEmpty").style.display = received.length ? "none" : "block";
+  $("#receivedBody").innerHTML = received.map(e => `<tr>
+    <td class="num">${e.seq}</td>
+    <td>${fmtTime(e.first_received_at)}</td>
+    <td>${esc(e.artifact)}</td>
+    <td>${kindPill(e.kind)}</td>
+    <td class="num">${e.fault_gen}</td>
+    <td title="${esc(e.reason || "")}">${esc((e.reason || "").slice(0, 36))}</td>
+    <td class="num">${e.deliveries}</td>
+  </tr>`).join("");
+
+  const delivered = outbox.delivered || [];
+  $("#deliveredEmpty").style.display = delivered.length ? "none" : "block";
+  $("#deliveredBody").innerHTML = delivered.map(e => `<tr>
+    <td>${fmtTime(e.delivered_at)}</td>
+    <td>${esc(e.artifact)}</td>
+    <td>${kindPill(e.kind)}</td>
+    <td class="num">${e.fault_gen}</td>
+    <td class="num">${e.attempts}</td>
+  </tr>`).join("");
+}
+
+async function setReceiverMode(mode) {
+  const r = await jget("/api/receiver-mode", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+  if (!r.ok) { banner("设置接收器模式失败：" + (r.body.error || r.status)); return; }
+  await refreshAlerts();
 }
 
 // ---------------------------------------------------------------- wiring
@@ -349,6 +494,13 @@ $("#applyModeBtn").addEventListener("click", () => applyMode(state.mode));
 $("#delay").addEventListener("change", () => { if (state.mode === "delay") applyMode("delay"); else renderMode(); });
 $("#refreshStatsBtn").addEventListener("click", refresh);
 $("#resetUpstreamBtn").addEventListener("click", async () => { await jget("/api/upstream-stats/reset", { method: "POST" }); await refresh(); });
+document.querySelectorAll("#receiverSwitch button").forEach(btn => btn.addEventListener("click", () => setReceiverMode(btn.dataset.rmode)));
+$("#refreshAlertsBtn").addEventListener("click", refreshAlerts);
+$("#clearReceivedBtn").addEventListener("click", async () => {
+  if (!confirm("清空接收器的已收记录？")) return;
+  await jget("/api/receiver-reset", { method: "POST" });
+  await refreshAlerts();
+});
 $("#resetAllBtn").addEventListener("click", async () => {
   if (!confirm("重置所有熔断状态与计数？")) return;
   await jget("/api/reset", { method: "POST" });

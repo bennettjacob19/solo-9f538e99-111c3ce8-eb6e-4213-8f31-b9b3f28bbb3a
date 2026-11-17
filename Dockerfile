@@ -9,7 +9,7 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py upstream.py ./
+COPY app.py upstream.py receiver.py ./
 COPY static ./static
 COPY artifacts ./artifacts
 

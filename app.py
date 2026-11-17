@@ -25,6 +25,23 @@ Breaker semantics (per artifact name)
   can neither reset the counter nor close the circuit.
 * Probe results carry the probe generation.  A late result from an older probe
   generation is discarded, so it cannot overwrite a newer verdict.
+
+Alerting
+--------
+* Transitions an on-call engineer must see — the first trip of a fault,
+  recovery by a successful probe, and manual reset — are recorded as status
+  events (artifact, fault generation, reason) in a durable SQLite outbox, in
+  the same transaction as the breaker state change.  If the state change
+  committed, the event is committed.
+* A background dispatcher (lease-gated, exactly one of the two workers) posts
+  pending events to a local alert receiver and retries with backoff until the
+  receiver acknowledges.  Receiver rejections and gateway restarts only delay
+  delivery; the receiver deduplicates by event id, so a retried delivery
+  (e.g. after a lost acknowledgement) never creates a second record.
+* Events for one artifact are delivered in occurrence order: a recovery can
+  never overtake a still-pending trip.  A failed probe belongs to the same
+  fault generation and raises no new event; stale results from older
+  generations raise none either.
 """
 
 from __future__ import annotations
@@ -56,6 +73,14 @@ FAILURE_THRESHOLD = int(os.environ.get("FAILURE_THRESHOLD", "3"))
 # considered abandoned (e.g. its process died before writing a verdict).
 PROBE_LEASE = max(2.0, REQUEST_TIMEOUT + 1.0)
 
+# Alert pipeline: durable outbox -> local alert receiver.
+RECEIVER_URL = os.environ.get("RECEIVER_URL", "http://receiver:9001").rstrip("/")
+DISPATCH_INTERVAL = float(os.environ.get("DISPATCH_INTERVAL", "0.5"))
+DELIVERY_TIMEOUT = float(os.environ.get("ALERT_DELIVERY_TIMEOUT", "2.0"))
+# The dispatching worker renews this lease before every delivery; if it dies,
+# the other worker takes over once the lease expires.
+DISPATCH_LEASE_TTL = max(4.0, 2.0 * DELIVERY_TIMEOUT)
+
 CLOSED = "closed"
 OPEN = "open"
 HALF_OPEN = "half_open"
@@ -79,6 +104,7 @@ CREATE TABLE IF NOT EXISTS breakers (
     probe_gen       INTEGER NOT NULL DEFAULT 0,
     probe_holder    TEXT,
     epoch           INTEGER NOT NULL DEFAULT 0,
+    fault_gen       INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
     last_transition REAL NOT NULL DEFAULT 0,
     updated_at      REAL NOT NULL DEFAULT 0
@@ -96,6 +122,36 @@ CREATE TABLE IF NOT EXISTS upstream_stats (
     hits_by_mode TEXT NOT NULL DEFAULT '{}'
 );
 INSERT OR IGNORE INTO upstream_stats (id, hits) VALUES (1, 0);
+-- Durable alert outbox.  Rows are inserted in the same transaction as the
+-- breaker state change they describe, and deleted only long after delivery.
+CREATE TABLE IF NOT EXISTS alert_outbox (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id        TEXT NOT NULL UNIQUE,
+    artifact        TEXT NOT NULL,
+    fault_gen       INTEGER NOT NULL,
+    kind            TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT '',
+    created_at      REAL NOT NULL,
+    next_attempt_at REAL NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    delivered_at    REAL,
+    last_error      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alert_outbox_pending
+    ON alert_outbox (artifact, id) WHERE delivered_at IS NULL;
+-- Monotonic per-artifact fault generation.  Survives /api/reset so event ids
+-- are never reused for a different incident.
+CREATE TABLE IF NOT EXISTS fault_counter (
+    artifact TEXT PRIMARY KEY,
+    next_gen INTEGER NOT NULL DEFAULT 0
+);
+-- Lease ensuring exactly one of the two workers dispatches alerts.
+CREATE TABLE IF NOT EXISTS dispatcher_lease (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    holder     TEXT NOT NULL DEFAULT '',
+    expires_at REAL NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO dispatcher_lease (id, holder, expires_at) VALUES (1, '', 0);
 """
 
 
@@ -116,6 +172,7 @@ def init_db() -> None:
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript(SCHEMA)
+                _migrate(conn)
             finally:
                 conn.close()
             return
@@ -123,6 +180,23 @@ def init_db() -> None:
             last = exc
             time.sleep(0.1)
     raise RuntimeError(f"unable to initialise breaker database: {last}")
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotent schema upgrades for databases created by older versions."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(breakers)")}
+    if "fault_gen" not in cols:
+        conn.execute("ALTER TABLE breakers ADD COLUMN fault_gen INTEGER NOT NULL DEFAULT 0")
+    # A breaker already faulted when the column appeared gets a generation
+    # allocated, so its recovery/reset alerts can reference the fault.
+    rows = conn.execute(
+        "SELECT artifact FROM breakers WHERE state <> ? AND fault_gen = 0", (CLOSED,)
+    ).fetchall()
+    for row in rows:
+        gen = _next_fault_gen(conn, row["artifact"])
+        conn.execute(
+            "UPDATE breakers SET fault_gen = ? WHERE artifact = ?", (gen, row["artifact"])
+        )
 
 
 @contextlib.contextmanager
@@ -147,6 +221,39 @@ def log_event(conn: sqlite3.Connection, artifact: str, kind: str, detail: str = 
         (time.time(), artifact, kind, detail[:300]),
     )
     conn.execute("DELETE FROM events WHERE id <= (SELECT MAX(id) - 500 FROM events)")
+
+
+def _next_fault_gen(conn: sqlite3.Connection, artifact: str) -> int:
+    """Allocate the next fault generation for an artifact.
+
+    Generations are monotonic per artifact and survive ``/api/reset``, so an
+    event id never refers to two different incidents.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO fault_counter (artifact, next_gen) VALUES (?, 0)", (artifact,)
+    )
+    conn.execute("UPDATE fault_counter SET next_gen = next_gen + 1 WHERE artifact = ?", (artifact,))
+    row = conn.execute(
+        "SELECT next_gen FROM fault_counter WHERE artifact = ?", (artifact,)
+    ).fetchone()
+    return int(row["next_gen"])
+
+
+def _enqueue_alert(
+    conn: sqlite3.Connection, artifact: str, fault_gen: int, kind: str, reason: str, now: float
+) -> None:
+    """Queue a status event in the same transaction as the state change.
+
+    The event id is deterministic (``artifact#generation:kind``), so even a
+    duplicate enqueue attempt cannot create a second outbox row for the same
+    transition.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO alert_outbox "
+        "(event_id, artifact, fault_gen, kind, reason, created_at, next_attempt_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (f"{artifact}#{fault_gen}:{kind}", artifact, fault_gen, kind, reason[:300], now, now),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +427,14 @@ def record_outcome(artifact: str, adm: Admission, outcome: Outcome, hit_role: Op
                     "WHERE artifact = ?",
                     (CLOSED, now, now, artifact),
                 )
+                _enqueue_alert(
+                    conn,
+                    artifact,
+                    row["fault_gen"],
+                    "recovered",
+                    f"recovery probe succeeded ({outcome.detail})",
+                    now,
+                )
                 log_event(conn, artifact, "probe_success", "circuit closed")
                 result.update(effect="closed", state=CLOSED)
             else:
@@ -359,13 +474,16 @@ def record_outcome(artifact: str, adm: Admission, outcome: Outcome, hit_role: Op
         else:
             failures = row["failures"] + 1
             if failures >= FAILURE_THRESHOLD:
+                fault_gen = _next_fault_gen(conn, artifact)
                 conn.execute(
                     "UPDATE breakers SET state = ?, failures = ?, opened_at = ?, "
                     "epoch = epoch + 1, probe_holder = NULL, last_error = ?, "
-                    "last_transition = ?, updated_at = ? WHERE artifact = ?",
-                    (OPEN, failures, now, outcome.detail, now, now, artifact),
+                    "last_transition = ?, updated_at = ?, fault_gen = ? WHERE artifact = ?",
+                    (OPEN, failures, now, outcome.detail, now, now, fault_gen, artifact),
                 )
-                log_event(conn, artifact, "opened", f"{failures} consecutive failures: {outcome.detail}")
+                reason = f"{failures} consecutive failures: {outcome.detail}"
+                _enqueue_alert(conn, artifact, fault_gen, "opened", reason, now)
+                log_event(conn, artifact, "opened", reason)
                 result.update(effect="opened", state=OPEN)
             else:
                 conn.execute(
@@ -476,6 +594,166 @@ def get_gateway_hits() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Alert dispatcher: durable outbox -> local receiver
+# ---------------------------------------------------------------------------
+#
+# Exactly one worker dispatches at a time (dispatcher_lease).  Events are
+# delivered per artifact in insertion order: only the oldest undelivered event
+# of each artifact is a candidate, so a recovery can never overtake a pending
+# trip.  Delivery is at-least-once; the receiver deduplicates by event id, so
+# a retry after a lost acknowledgement updates the same record.
+
+
+def _has_due_events(now: float) -> bool:
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM alert_outbox WHERE delivered_at IS NULL AND next_attempt_at <= ? "
+            "LIMIT 1",
+            (now,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _acquire_dispatch_lease() -> bool:
+    """Acquire or renew the dispatcher lease; False if another worker holds it."""
+    now = time.time()
+    with write_tx() as conn:
+        row = conn.execute(
+            "SELECT holder, expires_at FROM dispatcher_lease WHERE id = 1"
+        ).fetchone()
+        if row and row["holder"] != INSTANCE_ID and row["expires_at"] > now:
+            return False
+        conn.execute(
+            "INSERT INTO dispatcher_lease (id, holder, expires_at) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET holder = excluded.holder, "
+            "expires_at = excluded.expires_at",
+            (INSTANCE_ID, now + DISPATCH_LEASE_TTL),
+        )
+    return True
+
+
+def _due_heads(now: float) -> list[sqlite3.Row]:
+    """Oldest due undelivered event per artifact.
+
+    Later events of the same artifact are never selected while an earlier one
+    is undelivered, which enforces per-artifact occurrence order.
+    """
+    conn = connect()
+    try:
+        return conn.execute(
+            """
+            SELECT o.* FROM alert_outbox o
+            WHERE o.delivered_at IS NULL
+              AND o.next_attempt_at <= ?
+              AND o.id = (
+                    SELECT MIN(o2.id) FROM alert_outbox o2
+                    WHERE o2.artifact = o.artifact AND o2.delivered_at IS NULL
+              )
+            ORDER BY o.id
+            """,
+            (now,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def _post_event(payload: dict[str, Any]) -> tuple[bool, str]:
+    """POST one event to the receiver; (ok, error) — module-level for tests."""
+    try:
+        with httpx.Client(timeout=httpx.Timeout(DELIVERY_TIMEOUT)) as client:
+            resp = client.post(f"{RECEIVER_URL}/alerts", json=payload)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"[:300]
+    if 200 <= resp.status_code < 300:
+        return True, ""
+    return False, f"receiver HTTP {resp.status_code}: {resp.text[:200]}"
+
+
+def _deliver(row: sqlite3.Row) -> None:
+    payload = {
+        "event_id": row["event_id"],
+        "artifact": row["artifact"],
+        "fault_gen": row["fault_gen"],
+        "kind": row["kind"],
+        "reason": row["reason"],
+        "occurred_at": row["created_at"],
+        "attempt": row["attempts"] + 1,
+    }
+    ok, err = _post_event(payload)
+    now = time.time()
+    with write_tx() as conn:
+        if ok:
+            conn.execute(
+                "UPDATE alert_outbox SET delivered_at = ?, attempts = attempts + 1, "
+                "last_error = NULL WHERE id = ?",
+                (now, row["id"]),
+            )
+        else:
+            attempts = row["attempts"] + 1
+            delay = min(0.5 * (2 ** min(attempts, 5)), 10.0)
+            conn.execute(
+                "UPDATE alert_outbox SET attempts = ?, next_attempt_at = ?, last_error = ? "
+                "WHERE id = ?",
+                (attempts, now + delay, err, row["id"]),
+            )
+
+
+_last_prune = 0.0
+
+
+def _prune_delivered(now: float) -> None:
+    """Drop delivery history older than an hour (throttled, best-effort)."""
+    global _last_prune
+    if now - _last_prune < 600:
+        return
+    _last_prune = now
+    try:
+        with write_tx() as conn:
+            conn.execute(
+                "DELETE FROM alert_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?",
+                (now - 3600,),
+            )
+    except sqlite3.Error:
+        pass
+
+
+def dispatch_pending() -> None:
+    """One dispatcher pass; only the lease holder delivers."""
+    if not RECEIVER_URL:
+        return
+    now = time.time()
+    if not _has_due_events(now):
+        _prune_delivered(now)
+        return
+    if not _acquire_dispatch_lease():
+        return
+    for _ in range(100):  # bound one pass; the periodic loop re-enters
+        heads = _due_heads(time.time())
+        if not heads:
+            return
+        for row in heads:
+            # Renew before every delivery (a delivery may take up to
+            # DELIVERY_TIMEOUT); stop if another worker won the lease.
+            if not _acquire_dispatch_lease():
+                return
+            _deliver(row)
+
+
+async def dispatcher_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(dispatch_pending)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # the outbox is durable; a failed pass is retried
+            pass
+        await asyncio.sleep(DISPATCH_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
 # HTTP API
 # ---------------------------------------------------------------------------
 
@@ -483,9 +761,13 @@ def get_gateway_hits() -> dict[str, Any]:
 async def lifespan(_: FastAPI):
     init_db()
     clean_stale_probes()
+    dispatcher = asyncio.create_task(dispatcher_loop())
     try:
         yield
     finally:
+        dispatcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await dispatcher
         await close_upstream_client()
 
 
@@ -592,6 +874,7 @@ def _snapshot() -> dict[str, Any]:
                     "probe_gen": row["probe_gen"],
                     "probe_holder": row["probe_holder"],
                     "epoch": row["epoch"],
+                    "fault_gen": row["fault_gen"],
                     "last_error": row["last_error"],
                 }
             )
@@ -622,7 +905,15 @@ async def reset() -> dict[str, Any]:
 
 
 def _reset() -> None:
+    now = time.time()
     with write_tx() as conn:
+        rows = conn.execute("SELECT * FROM breakers").fetchall()
+        for row in rows:
+            state, _ = effective_state(row, now)
+            if state == CLOSED:
+                continue  # no active fault -> nothing to alert about
+            gen = row["fault_gen"] or _next_fault_gen(conn, row["artifact"])
+            _enqueue_alert(conn, row["artifact"], gen, "reset", "manual reset", now)
         conn.execute("DELETE FROM breakers")
         conn.execute("DELETE FROM events")
         conn.execute("UPDATE upstream_stats SET hits = 0, hits_by_mode = '{}' WHERE id = 1")
@@ -675,6 +966,96 @@ async def set_upstream_script(request: Request) -> JSONResponse:
     """Install scripted upstream responses (used by the automated tests)."""
     payload = await request.json()
     return await _proxy("POST", "/control/script", payload)
+
+
+# -- alert outbox + receiver control ----------------------------------------
+
+
+@app.get("/api/alerts")
+async def alerts() -> JSONResponse:
+    """Gateway outbox view plus the receiver's view (mode, received records)."""
+    outbox = await asyncio.to_thread(_outbox_snapshot)
+    receiver: dict[str, Any]
+    if not RECEIVER_URL:
+        receiver = {"error": "RECEIVER_URL not configured"}
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
+                resp = await client.get(f"{RECEIVER_URL}/alerts")
+            receiver = resp.json()
+        except Exception as exc:
+            receiver = {"error": f"{type(exc).__name__}: {exc}"[:300]}
+    return JSONResponse(
+        {
+            "receiver_url": RECEIVER_URL,
+            "outbox": outbox,
+            "receiver": receiver,
+            "pid": os.getpid(),
+        }
+    )
+
+
+def _outbox_snapshot() -> dict[str, Any]:
+    now = time.time()
+    conn = connect()
+    try:
+        pending = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT id, event_id, artifact, fault_gen, kind, reason, created_at, attempts, "
+                "next_attempt_at, last_error FROM alert_outbox "
+                "WHERE delivered_at IS NULL ORDER BY id"
+            ).fetchall()
+        ]
+        delivered = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT id, event_id, artifact, fault_gen, kind, reason, created_at, attempts, "
+                "delivered_at FROM alert_outbox WHERE delivered_at IS NOT NULL "
+                "ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+        ]
+        delivered_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM alert_outbox WHERE delivered_at IS NOT NULL"
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+    for row in pending:
+        row["retry_in"] = round(max(0.0, row["next_attempt_at"] - now), 2)
+    return {
+        "pending": pending,
+        "delivered": delivered,
+        "pending_count": len(pending),
+        "delivered_count": delivered_count,
+    }
+
+
+async def _receiver_proxy(method: str, path: str, payload: Any = None) -> JSONResponse:
+    if not RECEIVER_URL:
+        return JSONResponse(status_code=503, content={"error": "RECEIVER_URL not configured"})
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
+            resp = await client.request(method, f"{RECEIVER_URL}{path}", json=payload)
+        try:
+            content = resp.json()
+        except ValueError:
+            content = {"raw": resp.text[:1000]}
+        return JSONResponse(status_code=resp.status_code, content=content)
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"error": str(exc)[:300]})
+
+
+@app.post("/api/receiver-mode")
+async def set_receiver_mode(request: Request) -> JSONResponse:
+    """Switch the local receiver between accepting and rejecting deliveries."""
+    payload = await request.json()
+    return await _receiver_proxy("POST", "/control/mode", {"mode": payload.get("mode")})
+
+
+@app.post("/api/receiver-reset")
+async def reset_receiver() -> JSONResponse:
+    """Clear the receiver's received-records log (demo helper)."""
+    return await _receiver_proxy("POST", "/control/reset")
 
 
 # -- web UI ----------------------------------------------------------------
